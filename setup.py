@@ -54,6 +54,7 @@ setup(
         "requests",
         "pydub",
         "ruamel.yaml<=0.17.21",
+        "ruamel.yaml.clib<=0.2.12; platform_python_implementation == 'CPython' and python_version < '3.11'",
         "pillow",
         "language-tags",
         "retrying",
