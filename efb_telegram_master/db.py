@@ -475,6 +475,142 @@ class DatabaseManager:
         except DoesNotExist:
             return
 
+    # ``slave_message_id`` used by chat head rows. A chat head is a fake message
+    # log entry created by ``ChatBindingManager.make_chat_head``: it anchors a
+    # "/chat" initiated conversation, so that replying to the chat head message
+    # in Telegram can be routed to the right slave chat. These rows must never
+    # be purged, otherwise conversations started via ``/chat`` would break.
+    CHAT_HEAD_SLAVE_MSG_ID = "__chathead__"
+
+    @staticmethod
+    def purge_old_messages(strip_after_days: int = 30,
+                           purge_after_days: int = 180,
+                           batch_size: int = 1000,
+                           vacuum: bool = True) -> Dict[str, int]:
+        """Two-tier retention cleanup for the ``msglog`` table.
+
+        The ``msglog`` table keeps growing forever by default. This method
+        reclaims space in two tiers while preserving routing ability:
+
+        1. **Strip** (soft): rows older than ``strip_after_days`` have their
+           content wiped (``text``, ``pickle``, ``file_id``,
+           ``file_unique_id``, ``mime``, ``media_type``) but the ID mapping
+           (``master_msg_id`` <-> slave IDs, chat references) is kept, so
+           reply/edit/recall routing still works.
+        2. **Purge** (hard): rows older than ``purge_after_days`` are deleted
+           entirely.
+
+        Chat head rows (``slave_message_id == "__chathead__"``) are always
+        excluded, as they anchor conversations started via ``/chat``.
+
+        Args:
+            strip_after_days: Strip message content older than this many days.
+                Set to 0 to disable stripping.
+            purge_after_days: Delete message logs older than this many days.
+                Set to 0 to disable purging. Must be >= ``strip_after_days``.
+            batch_size: Max rows deleted per batch, to avoid locking the
+                database for too long.
+            vacuum: Run ``VACUUM`` afterwards to reclaim disk space.
+
+        Returns:
+            A dict with ``stripped`` and ``deleted`` row counts.
+
+        Raises:
+            ValueError: If the arguments are invalid.
+        """
+        DatabaseManager._validate_purge_args(strip_after_days, purge_after_days, batch_size)
+        if not strip_after_days and not purge_after_days:
+            return {"stripped": 0, "deleted": 0}
+
+        now = datetime.datetime.now()
+        not_chat_head = MsgLog.slave_message_id != DatabaseManager.CHAT_HEAD_SLAVE_MSG_ID
+        stats = {"stripped": 0, "deleted": 0}
+
+        # Tier 1: strip content, keep the ID mapping.
+        # Rows that also fall into the purge range are skipped here, as they
+        # will be deleted entirely in tier 2 anyway.
+        if strip_after_days:
+            strip_cutoff = now - datetime.timedelta(days=strip_after_days)
+            strip_cond = (MsgLog.time < strip_cutoff) & not_chat_head
+            if purge_after_days:
+                purge_cutoff = now - datetime.timedelta(days=purge_after_days)
+                strip_cond = strip_cond & (MsgLog.time >= purge_cutoff)
+            stats["stripped"] = (MsgLog
+                                 .update(text="",
+                                         pickle=None,
+                                         file_id=None,
+                                         file_unique_id=None,
+                                         mime=None,
+                                         media_type=None)
+                                 .where(strip_cond)
+                                 .execute())
+
+        # Tier 2: delete rows entirely, in batches to avoid long write locks.
+        if purge_after_days:
+            purge_cutoff = now - datetime.timedelta(days=purge_after_days)
+            while True:
+                deleted = (MsgLog
+                           .delete()
+                           .where((MsgLog.time < purge_cutoff) & not_chat_head)
+                           .limit(batch_size)
+                           .execute())
+                stats["deleted"] += deleted
+                if deleted < batch_size:
+                    break
+
+        # SQLite does not shrink the file on DELETE; VACUUM reclaims the space.
+        if vacuum and (stats["stripped"] or stats["deleted"]):
+            database.execute_sql("VACUUM;")
+
+        return stats
+
+    @staticmethod
+    def _validate_purge_args(strip_after_days: int, purge_after_days: int, batch_size: int = 1):
+        """Validate arguments shared by ``purge_old_messages`` and ``estimate_purge``."""
+        if strip_after_days < 0 or purge_after_days < 0:
+            raise ValueError("strip_after_days and purge_after_days must be non-negative.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if purge_after_days and strip_after_days and purge_after_days < strip_after_days:
+            raise ValueError("purge_after_days must be greater than or equal to strip_after_days.")
+
+    @staticmethod
+    def estimate_purge(strip_after_days: int = 30,
+                       purge_after_days: int = 180) -> Dict[str, int]:
+        """Dry-run counterpart of ``purge_old_messages``.
+
+        Counts how many ``msglog`` rows would be stripped/purged without
+        modifying anything. Chat head rows are excluded, same as in
+        ``purge_old_messages``.
+
+        Returns:
+            A dict with ``strip`` and ``purge`` row counts.
+
+        Raises:
+            ValueError: If the arguments are invalid.
+        """
+        DatabaseManager._validate_purge_args(strip_after_days, purge_after_days)
+        now = datetime.datetime.now()
+        not_chat_head = MsgLog.slave_message_id != DatabaseManager.CHAT_HEAD_SLAVE_MSG_ID
+        estimate = {"strip": 0, "purge": 0}
+
+        purge_cutoff = None
+        if purge_after_days:
+            purge_cutoff = now - datetime.timedelta(days=purge_after_days)
+            estimate["purge"] = (MsgLog
+                                 .select()
+                                 .where((MsgLog.time < purge_cutoff) & not_chat_head)
+                                 .count())
+
+        if strip_after_days:
+            strip_cutoff = now - datetime.timedelta(days=strip_after_days)
+            strip_cond = (MsgLog.time < strip_cutoff) & not_chat_head
+            if purge_cutoff is not None:
+                strip_cond = strip_cond & (MsgLog.time >= purge_cutoff)
+            estimate["strip"] = MsgLog.select().where(strip_cond).count()
+
+        return estimate
+
     @staticmethod
     def get_slave_chat_info(slave_channel_id: Optional[ModuleID] = None,
                             slave_chat_uid: Optional[ChatID] = None,
