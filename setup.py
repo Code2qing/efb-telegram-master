@@ -53,7 +53,7 @@ setup(
         "peewee",
         "requests",
         "pydub",
-        "ruamel.yaml",
+        "ruamel.yaml<=0.17.21",
         "pillow",
         "language-tags",
         "retrying",
