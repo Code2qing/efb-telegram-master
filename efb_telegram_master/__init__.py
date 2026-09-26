@@ -3,7 +3,9 @@
 import html
 import logging
 import mimetypes
+import threading
 import time
+from datetime import datetime, timedelta
 from gettext import NullTranslations, translation
 from typing import Optional, List, Callable
 from xmlrpc.server import SimpleXMLRPCServer
@@ -149,6 +151,9 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.dispatcher.add_handler(
             CommandHandler("react", self.react, filters=non_edit_filter)
         )
+        self.bot_manager.dispatcher.add_handler(
+            CommandHandler("purge", self.purge, filters=non_edit_filter)
+        )
 
         # Register master message handlers after commands to prevent commands
         # commands to be delivered as messages
@@ -157,6 +162,86 @@ class TelegramChannel(MasterChannel):
         self.bot_manager.dispatcher.add_error_handler(self.error)
 
         self.rpc_utilities = RPCUtilities(self)
+
+        self.start_msglog_purge_scheduler()
+
+    def start_msglog_purge_scheduler(self):
+        """Start the background scheduler for old message log cleanup.
+
+        When the ``msglog_purge_enabled`` flag is on, a daemon thread runs
+        ``DatabaseManager.purge_old_messages`` once shortly after startup and
+        then every 24 hours. Use ``stop_msglog_purge_scheduler`` (called by
+        ``stop_polling``) to stop it.
+        """
+        self._msglog_purge_stop_event: Optional[threading.Event] = None
+        self._msglog_purge_thread: Optional[threading.Thread] = None
+        if not self.flag("msglog_purge_enabled"):
+            self.logger.debug("Message log purge scheduler is disabled.")
+            return
+        try:
+            strip_after_days = int(self.flag("msglog_strip_after_days"))
+            purge_after_days = int(self.flag("msglog_purge_after_days"))
+            batch_size = int(self.flag("msglog_purge_batch_size"))
+            purge_hour = int(self.flag("msglog_purge_hour"))
+        except (TypeError, ValueError) as e:
+            self.logger.error("Invalid msglog purge flags (%s). Scheduler not started.", e)
+            return
+        if purge_after_days and strip_after_days and purge_after_days < strip_after_days:
+            self.logger.error("msglog_purge_after_days must be >= msglog_strip_after_days. "
+                              "Scheduler not started.")
+            return
+        if not 0 <= purge_hour <= 23:
+            self.logger.error("msglog_purge_hour must be between 0 and 23. Scheduler not started.")
+            return
+        self._msglog_purge_stop_event = threading.Event()
+        self._msglog_purge_thread = threading.Thread(
+            target=self._msglog_purge_loop,
+            args=(strip_after_days, purge_after_days, batch_size, purge_hour),
+            name="etm-msglog-purge",
+            daemon=True)
+        self._msglog_purge_thread.start()
+        self.logger.info("Message log purge scheduler started "
+                         "(strip after %s days, purge after %s days, daily at %02d:00).",
+                         strip_after_days, purge_after_days, purge_hour)
+
+    def stop_msglog_purge_scheduler(self):
+        """Stop the background message log purge scheduler if it is running."""
+        if self._msglog_purge_stop_event is not None:
+            self._msglog_purge_stop_event.set()
+
+    def _msglog_purge_loop(self, strip_after_days: int, purge_after_days: int,
+                             batch_size: int, purge_hour: int):
+        assert self._msglog_purge_stop_event is not None
+        # Initial delay so the purge does not compete with startup.
+        if self._msglog_purge_stop_event.wait(60):
+            return
+        while not self._msglog_purge_stop_event.is_set():
+            try:
+                stats = self.db.purge_old_messages(
+                    strip_after_days=strip_after_days,
+                    purge_after_days=purge_after_days,
+                    batch_size=batch_size)
+                self.logger.info("Message log purge finished: %s rows stripped, %s rows deleted.",
+                                 stats["stripped"], stats["deleted"])
+            except Exception:
+                self.logger.exception("Message log purge failed.")
+            # Sleep until the next fixed daily run time instead of a fixed
+            # 24h interval, so the time spent on purging never pushes the
+            # schedule later.
+            delay = self._seconds_until_next_purge(purge_hour)
+            next_run = datetime.now() + timedelta(seconds=delay)
+            self.logger.debug("Next message log purge scheduled at %s.", next_run)
+            if self._msglog_purge_stop_event.wait(delay):
+                break
+
+    @staticmethod
+    def _seconds_until_next_purge(hour: int) -> float:
+        """Seconds from now until the next ``hour``:00 (server local time)."""
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
 
     @property
     def _(self) -> Callable[[str], str]:
@@ -420,6 +505,55 @@ class TelegramChannel(MasterChannel):
             message.reply_text(prompt)
             return
 
+    def purge(self, update: Update, context: CallbackContext):
+        """Manually trigger message log cleanup. Usage: /purge [run]"""
+        assert isinstance(update, Update)
+        assert isinstance(update.effective_message, Message)
+        message: Message = update.effective_message
+
+        args = context.args or []
+        mode = args[0].lower() if args else "dry-run"
+        if mode not in ("dry-run", "run"):
+            message.reply_text(self._("Usage: /purge [run]\n"
+                                      "Without arguments, show a dry-run preview. "
+                                      "Use /purge run to execute the cleanup."))
+            return
+
+        try:
+            strip_after_days = int(self.flag("msglog_strip_after_days"))
+            purge_after_days = int(self.flag("msglog_purge_after_days"))
+            batch_size = int(self.flag("msglog_purge_batch_size"))
+        except (TypeError, ValueError):
+            message.reply_text(self._("Invalid msglog purge flags in configuration."))
+            return
+
+        if mode == "run":
+            message.reply_text(self._("Purging message logs, this may take a while..."))
+            try:
+                stats = self.db.purge_old_messages(strip_after_days=strip_after_days,
+                                                   purge_after_days=purge_after_days,
+                                                   batch_size=batch_size)
+            except ValueError as e:
+                message.reply_text(self._("Purge aborted: {0}").format(e))
+                return
+            message.reply_text(
+                self._("Message log purge finished.\n"
+                       "{stripped} rows stripped, {deleted} rows deleted.").format(
+                           stripped=stats["stripped"], deleted=stats["deleted"]))
+            return
+
+        # dry-run preview
+        estimate = self.db.estimate_purge(strip_after_days=strip_after_days,
+                                          purge_after_days=purge_after_days)
+        message.reply_text(
+            self._("Message log purge preview (dry run, nothing was changed):\n"
+                   "Strip content older than {strip_days} days: {strip} rows\n"
+                   "Delete logs older than {purge_days} days: {purge} rows\n"
+                   "Chat head rows are never purged.\n\n"
+                   "Send /purge run to execute.").format(
+                       strip_days=strip_after_days, strip=estimate["strip"],
+                       purge_days=purge_after_days, purge=estimate["purge"]))
+
     def help(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
         assert isinstance(update.message, Message)
@@ -443,6 +577,8 @@ class TelegramChannel(MasterChannel):
                      "    Only works in singly linked group where the bot is an admin.\n"
                      "/rm\n"
                      "    Remove the quoted message from its remote chat.\n"
+                     "/purge [run]\n"
+                     "    Preview (dry run) or execute message log cleanup.\n"
                      "/help\n"
                      "    Print this command list.")
         update.message.reply_text(txt)
@@ -583,6 +719,7 @@ class TelegramChannel(MasterChannel):
         self.rpc_utilities.shutdown()
         self.bot_manager.graceful_stop()
         self.master_messages.stop_worker()
+        self.stop_msglog_purge_scheduler()
         self.db.stop_worker()
         self.logger.debug("%s (%s) gracefully stopped.", self.channel_name, self.channel_id)
 

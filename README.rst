@@ -565,6 +565,52 @@ e.g.:
     Enable this option if the bot API is running in ``--local`` mode and
     is using the same file system with ETM.
 
+-   ``msglog_purge_enabled`` *(bool)* [Default: ``false``]
+
+    Enable automatic cleanup of the local message log database
+    (``msglog`` table in ``tgdata.db``), which grows indefinitely by
+    default. When enabled, a background thread runs the cleanup once
+    shortly after startup and then every 24 hours. Chat head rows
+    (``/chat`` conversation anchors) are never purged.
+
+    .. code:: yaml
+
+        flags:
+            msglog_purge_enabled: true
+            msglog_strip_after_days: 30
+            msglog_purge_after_days: 180
+
+-   ``msglog_strip_after_days`` *(int)* [Default: ``30``]
+
+    Messages older than this many days have their content wiped
+    (message text, quoted/reaction metadata, file references) while the
+    ID mapping is kept, so reply/edit/recall routing keeps working.
+    Set to ``0`` to disable. Only takes effect when
+    ``msglog_purge_enabled`` is ``true``.
+
+-   ``msglog_purge_after_days`` *(int)* [Default: ``180``]
+
+    Message logs older than this many days are deleted entirely. Must
+    be greater than or equal to ``msglog_strip_after_days``. Set to
+    ``0`` to disable. Only takes effect when ``msglog_purge_enabled``
+    is ``true``.
+
+-   ``msglog_purge_batch_size`` *(int)* [Default: ``1000``]
+
+    Maximum number of rows deleted per batch during purge, to avoid
+    locking the database for too long.
+
+-   ``msglog_purge_hour`` *(int)* [Default: ``4``]
+
+    Hour of day (0-23, server local time) at which the scheduled purge
+    runs. The purge always runs at this fixed time, so the time spent on
+    purging never pushes the schedule later.
+
+    You can also trigger a cleanup manually with the ``/purge`` command:
+    ``/purge`` shows a dry-run preview of what would be stripped and
+    deleted, and ``/purge run`` executes the cleanup. This works even when
+    ``msglog_purge_enabled`` is ``false``.
+
 Network configuration: timeout tweaks
 -------------------------------------
 

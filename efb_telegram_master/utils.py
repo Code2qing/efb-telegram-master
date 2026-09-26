@@ -55,6 +55,11 @@ class ExperimentalFlagsManager(LocaleMixin):
         "api_base_url": None,
         "api_base_file_url": None,
         "local_tdlib_api": False,
+        "msglog_purge_enabled": False,
+        "msglog_strip_after_days": 30,
+        "msglog_purge_after_days": 180,
+        "msglog_purge_batch_size": 1000,
+        "msglog_purge_hour": 4,
     }
 
     def __init__(self, channel: 'TelegramChannel'):
