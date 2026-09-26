@@ -7,6 +7,7 @@ import os
 import tempfile
 import traceback
 import urllib.parse
+import zlib
 from pathlib import Path
 from typing import Tuple, Optional, TYPE_CHECKING, List, IO, Union
 
@@ -44,6 +45,21 @@ if TYPE_CHECKING:
 
 class SlaveMessageProcessor(LocaleMixin):
     """Process messages as Message objects from slave channels."""
+
+    LAND_ANIMAL_EMOJIS: List[str] = [
+        "🐱", "🐶", "🦊", "🐼", "🐨", "🐯", "🦁", "🐰", "🐻", "🐵", "🐷", "🐸"
+    ]
+
+    @classmethod
+    def get_author_emoji(cls, author) -> str:
+        """
+        Return a deterministic land animal emoji based on author's unique ID.
+        """
+        if not author:
+            return cls.LAND_ANIMAL_EMOJIS[0]
+        uid = getattr(author, 'uid', None) or getattr(author, 'name', '') or str(author)
+        idx = zlib.crc32(str(uid).encode('utf-8')) % len(cls.LAND_ANIMAL_EMOJIS)
+        return cls.LAND_ANIMAL_EMOJIS[idx]
 
     def __init__(self, channel: 'TelegramChannel'):
         self.channel: 'TelegramChannel' = channel
@@ -966,7 +982,8 @@ class SlaveMessageProcessor(LocaleMixin):
         msg_prefix = ""  # For group member name
         if isinstance(msg.chat, GroupChat):
             self.logger.debug("[%s] Message is from a group. Sender: %s", msg.uid, msg.author)
-            msg_prefix = msg.author.long_name
+            author_icon = self.get_author_emoji(msg.author)
+            msg_prefix = f"{author_icon} {msg.author.long_name}"
 
         if singly_linked:
             if msg_prefix:  # if group message

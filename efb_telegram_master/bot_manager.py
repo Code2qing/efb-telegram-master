@@ -100,7 +100,8 @@ class TelegramBotManager(LocaleMixin):
                 suffix = (suffix and ("\n" + suffix)) or suffix
 
                 if str(kwargs.get('parse_mode', '')).lower() == "html":
-                    prefix = html.escape(prefix)
+                    if prefix:
+                        prefix = f"<b>{html.escape(prefix.rstrip(chr(10)))}</b>\n"
                     suffix = html.escape(suffix)
 
                 if len(prefix + text + suffix) >= telegram.constants.MAX_CAPTION_LENGTH:
@@ -199,7 +200,8 @@ class TelegramBotManager(LocaleMixin):
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
+            if prefix:
+                prefix = f"<b>{html.escape(prefix.rstrip(chr(10)))}</b>\n"
             suffix = html.escape(suffix)
         text: str
         if args[1:]:
@@ -248,7 +250,8 @@ class TelegramBotManager(LocaleMixin):
         prefix = (prefix and (prefix + "\n")) or prefix
         suffix = (suffix and ("\n" + suffix)) or suffix
         if str(kwargs.get('parse_mode', '')).lower() == "html":
-            prefix = html.escape(prefix)
+            if prefix:
+                prefix = f"<b>{html.escape(prefix.rstrip(chr(10)))}</b>\n"
             suffix = html.escape(suffix)
         text = kwargs.pop('text', '')
         if len(prefix + text + suffix) >= telegram.constants.MAX_MESSAGE_LENGTH:
