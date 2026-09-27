@@ -606,10 +606,11 @@ e.g.:
     runs. The purge always runs at this fixed time, so the time spent on
     purging never pushes the schedule later.
 
-    You can also trigger a cleanup manually with the ``/purge`` command:
-    ``/purge`` shows a dry-run preview of what would be stripped and
-    deleted, and ``/purge run`` executes the cleanup. This works even when
-    ``msglog_purge_enabled`` is ``false``.
+    You can also trigger a cleanup manually with the ``/purge`` command
+    (private chat with the bot only): ``/purge`` shows a dry-run preview
+    of what would be stripped and deleted, and ``/purge run`` executes
+    the cleanup in a background thread and reports back when done. This
+    works even when ``msglog_purge_enabled`` is ``false``.
 
 Network configuration: timeout tweaks
 -------------------------------------

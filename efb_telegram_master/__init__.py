@@ -208,6 +208,12 @@ class TelegramChannel(MasterChannel):
         """Stop the background message log purge scheduler if it is running."""
         if self._msglog_purge_stop_event is not None:
             self._msglog_purge_stop_event.set()
+        # Wait for an in-flight purge (or VACUUM) to finish before the
+        # database worker is stopped in stop_polling(); otherwise the purge
+        # thread may hit "database is closed" errors mid-write.
+        thread = self._msglog_purge_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
 
     def _msglog_purge_loop(self, strip_after_days: int, purge_after_days: int,
                              batch_size: int, purge_hour: int):
@@ -510,6 +516,9 @@ class TelegramChannel(MasterChannel):
         assert isinstance(update, Update)
         assert isinstance(update.effective_message, Message)
         message: Message = update.effective_message
+        if message.chat.type != telegram.Chat.PRIVATE:
+            message.reply_text(self._("This command can only be used in private chat with the bot."))
+            return
 
         args = context.args or []
         mode = args[0].lower() if args else "dry-run"
@@ -528,18 +537,15 @@ class TelegramChannel(MasterChannel):
             return
 
         if mode == "run":
-            message.reply_text(self._("Purging message logs, this may take a while..."))
-            try:
-                stats = self.db.purge_old_messages(strip_after_days=strip_after_days,
-                                                   purge_after_days=purge_after_days,
-                                                   batch_size=batch_size)
-            except ValueError as e:
-                message.reply_text(self._("Purge aborted: {0}").format(e))
-                return
-            message.reply_text(
-                self._("Message log purge finished.\n"
-                       "{stripped} rows stripped, {deleted} rows deleted.").format(
-                           stripped=stats["stripped"], deleted=stats["deleted"]))
+            # Run off the dispatcher thread: a big database plus VACUUM can
+            # block for seconds. Report back to the admin when it's done.
+            message.reply_text(self._("Purging message logs in the background, "
+                                      "I'll report back when it's done..."))
+            threading.Thread(target=self._purge_in_background,
+                             args=(strip_after_days, purge_after_days, batch_size,
+                                   message.chat_id),
+                             name="etm-msglog-purge-manual",
+                             daemon=True).start()
             return
 
         # dry-run preview
@@ -553,6 +559,24 @@ class TelegramChannel(MasterChannel):
                    "Send /purge run to execute.").format(
                        strip_days=strip_after_days, strip=estimate["strip"],
                        purge_days=purge_after_days, purge=estimate["purge"]))
+
+    def _purge_in_background(self, strip_after_days: int, purge_after_days: int,
+                             batch_size: int, chat_id: int):
+        """Execute a manual purge off the dispatcher thread, then report back."""
+        try:
+            stats = self.db.purge_old_messages(strip_after_days=strip_after_days,
+                                               purge_after_days=purge_after_days,
+                                               batch_size=batch_size)
+        except Exception as e:
+            self.logger.exception("Manual message log purge failed.")
+            self.bot_manager.send_message(
+                chat_id, self._("Message log purge failed: {0}").format(e))
+            return
+        self.bot_manager.send_message(
+            chat_id,
+            self._("Message log purge finished.\n"
+                   "{stripped} rows stripped, {deleted} rows deleted.").format(
+                       stripped=stats["stripped"], deleted=stats["deleted"]))
 
     def help(self, update: Update, context: CallbackContext):
         assert isinstance(update, Update)
