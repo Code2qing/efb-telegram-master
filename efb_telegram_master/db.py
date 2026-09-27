@@ -524,6 +524,18 @@ class DatabaseManager:
 
         now = datetime.datetime.now()
         not_chat_head = MsgLog.slave_message_id != DatabaseManager.CHAT_HEAD_SLAVE_MSG_ID
+        # Rows stripped by an earlier run keep matching the time condition
+        # forever. Only strip rows that still carry content: otherwise every
+        # run would re-UPDATE the same rows, inflate the "stripped" count,
+        # and trigger a pointless daily VACUUM.
+        needs_strip = (
+            (MsgLog.text != "") |
+            MsgLog.pickle.is_null(False) |
+            MsgLog.file_id.is_null(False) |
+            MsgLog.file_unique_id.is_null(False) |
+            MsgLog.mime.is_null(False) |
+            MsgLog.media_type.is_null(False)
+        )
         stats = {"stripped": 0, "deleted": 0}
 
         # Tier 1: strip content, keep the ID mapping.
@@ -531,7 +543,7 @@ class DatabaseManager:
         # will be deleted entirely in tier 2 anyway.
         if strip_after_days:
             strip_cutoff = now - datetime.timedelta(days=strip_after_days)
-            strip_cond = (MsgLog.time < strip_cutoff) & not_chat_head
+            strip_cond = (MsgLog.time < strip_cutoff) & not_chat_head & needs_strip
             if purge_after_days:
                 purge_cutoff = now - datetime.timedelta(days=purge_after_days)
                 strip_cond = strip_cond & (MsgLog.time >= purge_cutoff)
@@ -546,13 +558,21 @@ class DatabaseManager:
                                  .execute())
 
         # Tier 2: delete rows entirely, in batches to avoid long write locks.
+        # NOTE: this deliberately avoids DELETE ... LIMIT. That syntax needs
+        # the opt-in SQLITE_ENABLE_UPDATE_DELETE_LIMIT compile flag, which is
+        # missing from some SQLite builds (certain Docker images, NAS /
+        # Raspberry Pi builds, ...). A primary-key-bounded subquery works on
+        # every SQLite build.
         if purge_after_days:
             purge_cutoff = now - datetime.timedelta(days=purge_after_days)
             while True:
+                batch_subq = (MsgLog
+                              .select(MsgLog.master_msg_id)
+                              .where((MsgLog.time < purge_cutoff) & not_chat_head)
+                              .limit(batch_size))
                 deleted = (MsgLog
                            .delete()
-                           .where((MsgLog.time < purge_cutoff) & not_chat_head)
-                           .limit(batch_size)
+                           .where(MsgLog.master_msg_id.in_(batch_subq))
                            .execute())
                 stats["deleted"] += deleted
                 if deleted < batch_size:
@@ -592,6 +612,16 @@ class DatabaseManager:
         DatabaseManager._validate_purge_args(strip_after_days, purge_after_days)
         now = datetime.datetime.now()
         not_chat_head = MsgLog.slave_message_id != DatabaseManager.CHAT_HEAD_SLAVE_MSG_ID
+        # Same "still carries content" check as in purge_old_messages, so the
+        # dry-run numbers match what a real run would do.
+        needs_strip = (
+            (MsgLog.text != "") |
+            MsgLog.pickle.is_null(False) |
+            MsgLog.file_id.is_null(False) |
+            MsgLog.file_unique_id.is_null(False) |
+            MsgLog.mime.is_null(False) |
+            MsgLog.media_type.is_null(False)
+        )
         estimate = {"strip": 0, "purge": 0}
 
         purge_cutoff = None
@@ -604,7 +634,7 @@ class DatabaseManager:
 
         if strip_after_days:
             strip_cutoff = now - datetime.timedelta(days=strip_after_days)
-            strip_cond = (MsgLog.time < strip_cutoff) & not_chat_head
+            strip_cond = (MsgLog.time < strip_cutoff) & not_chat_head & needs_strip
             if purge_cutoff is not None:
                 strip_cond = strip_cond & (MsgLog.time >= purge_cutoff)
             estimate["strip"] = MsgLog.select().where(strip_cond).count()

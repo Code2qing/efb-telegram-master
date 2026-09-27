@@ -190,3 +190,42 @@ def test_seconds_until_next_purge():
     # delay is within (0, 24h].
     delay = TelegramChannel._seconds_until_next_purge(now.hour)
     assert 0 < delay <= 24 * 3600
+
+
+def test_strip_is_idempotent(mem_db):
+    # Already-stripped rows must not be re-UPDATE'd on the next run:
+    # otherwise the "stripped" count lies and VACUUM runs pointlessly.
+    _make_row(60, master_msg_id="old_msg", text="secret", pickle_data=b"p",
+              file_id="fid", mime="image/jpeg", media_type="photo")
+
+    first = DatabaseManager.purge_old_messages(strip_after_days=30,
+                                               purge_after_days=180,
+                                               vacuum=False)
+    assert first["stripped"] == 1
+
+    second = DatabaseManager.purge_old_messages(strip_after_days=30,
+                                                purge_after_days=180,
+                                                vacuum=False)
+    assert second == {"stripped": 0, "deleted": 0}
+
+    # The dry-run agrees: nothing left to strip.
+    estimate = DatabaseManager.estimate_purge(strip_after_days=30,
+                                              purge_after_days=180)
+    assert estimate["strip"] == 0
+
+
+def test_purge_batches_without_delete_limit(mem_db):
+    # Regression test for the DELETE ... LIMIT portability issue: batched
+    # deletes must go through a primary-key-bounded subquery, which works on
+    # every SQLite build, instead of relying on the opt-in
+    # SQLITE_ENABLE_UPDATE_DELETE_LIMIT compile flag.
+    for i in range(7):
+        _make_row(200, master_msg_id="ancient_%d" % i)
+
+    stats = DatabaseManager.purge_old_messages(strip_after_days=0,
+                                               purge_after_days=180,
+                                               batch_size=3,
+                                               vacuum=False)
+
+    assert stats["deleted"] == 7
+    assert MsgLog.select().count() == 0
